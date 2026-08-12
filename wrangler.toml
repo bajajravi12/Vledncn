@@ -1,4 +1,4 @@
 name = "vledncn"
-main = "index.js"
+main = "./index.js"
 compatibility_date = "2026-08-11"
 compatibility_flags = [ "nodejs_compat" ]
