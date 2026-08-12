@@ -3,7 +3,12 @@
 // Runtime: Cloudflare Workers (no Node.js APIs used).
 // Outbound TCP connections are made with the `cloudflare:sockets` API.
 
-import { connect } from 'cloudflare:sockets';
+// NOTE: cloudflare:sockets is imported dynamically (inside handleVlessSession)
+// instead of at the top of the file. A static top-level import crashes the
+// entire Worker on module load if TCP Sockets are unavailable in this
+// account/environment, which takes down every route including /health and
+// /. A dynamic import means only an actual VLESS connection attempt fails,
+// while normal HTTP routes keep working.
 
 const WS_READY_STATE_OPEN = 1;
 const WS_READY_STATE_CLOSING = 2;
@@ -21,7 +26,6 @@ export default {
       const isWebSocketRequest =
         upgradeHeader && upgradeHeader.toLowerCase() === 'websocket';
 
-      // Health check endpoint - kept separate from the VLESS WS endpoint.
       if (url.pathname === '/health') {
         return new Response(JSON.stringify({ status: 'ok' }), {
           status: 200,
@@ -36,18 +40,15 @@ export default {
         return await handleWebSocketUpgrade(request, env);
       }
 
-      // Any WebSocket upgrade attempt on a path other than WS_PATH is rejected.
       if (isWebSocketRequest) {
         return new Response('Not Found', { status: 404 });
       }
 
-      // Plain HTTP status page.
       return new Response('VLESS Worker is running', {
         status: 200,
         headers: { 'content-type': 'text/plain' },
       });
     } catch (err) {
-      // Never leak internal error details.
       return new Response('Internal Error', { status: 500 });
     }
   },
@@ -58,13 +59,9 @@ function normalizePath(path) {
   return path;
 }
 
-/**
- * Upgrades the HTTP request to a WebSocket and starts the VLESS session.
- */
 async function handleWebSocketUpgrade(request, env) {
   const uuidStr = (env.UUID || '').trim().toLowerCase();
   if (!isValidUUID(uuidStr)) {
-    // Server misconfiguration - do not proceed without a valid UUID secret.
     return new Response('Server not configured', { status: 500 });
   }
 
@@ -73,10 +70,8 @@ async function handleWebSocketUpgrade(request, env) {
 
   server.accept();
 
-  // Optional 0-RTT early data, passed by some clients via this header.
   const earlyDataHeader = request.headers.get('sec-websocket-protocol') || '';
 
-  // Run the session asynchronously; do not block the 101 response on it.
   handleVlessSession(server, uuidStr, earlyDataHeader).catch(() => {
     safeCloseWebSocket(server);
   });
@@ -87,10 +82,6 @@ async function handleWebSocketUpgrade(request, env) {
   });
 }
 
-/**
- * Wraps a Worker-side WebSocket's events in a ReadableStream so the data
- * can be consumed with normal stream APIs.
- */
 function makeReadableWebSocketStream(webSocketServer, earlyDataHeader) {
   let cancelled = false;
 
@@ -105,9 +96,7 @@ function makeReadableWebSocketStream(webSocketServer, earlyDataHeader) {
         if (cancelled) return;
         try {
           controller.close();
-        } catch (e) {
-          // controller may already be closed/errored
-        }
+        } catch (e) {}
       });
 
       webSocketServer.addEventListener('error', (err) => {
@@ -129,11 +118,6 @@ function makeReadableWebSocketStream(webSocketServer, earlyDataHeader) {
   });
 }
 
-/**
- * Core VLESS session: parses the VLESS header from the first WebSocket
- * message, opens the outbound TCP connection, and bridges data in both
- * directions.
- */
 async function handleVlessSession(webSocketServer, uuidStr, earlyDataHeader) {
   let remoteSocket = null;
   let remoteWriter = null;
@@ -147,8 +131,6 @@ async function handleVlessSession(webSocketServer, uuidStr, earlyDataHeader) {
     }
   };
 
-  // Guard against a client that never sends data / never completes a valid
-  // header (avoids orphaned Worker invocations).
   timeoutId = setTimeout(() => {
     if (!headerParsed) {
       safeCloseWebSocket(webSocketServer);
@@ -192,6 +174,7 @@ async function handleVlessSession(webSocketServer, uuidStr, earlyDataHeader) {
 
             let tcpSocket;
             try {
+              const { connect } = await import('cloudflare:sockets');
               tcpSocket = connect({
                 hostname: result.addressRemote,
                 port: result.portRemote,
@@ -209,7 +192,6 @@ async function handleVlessSession(webSocketServer, uuidStr, earlyDataHeader) {
               await remoteWriter.write(new Uint8Array(rawClientData));
             }
 
-            // Pipe remote -> WebSocket in the background.
             pipeRemoteToWebSocket(
               tcpSocket,
               webSocketServer,
@@ -230,7 +212,6 @@ async function handleVlessSession(webSocketServer, uuidStr, earlyDataHeader) {
       })
     );
   } catch (err) {
-    // Malformed data, connection errors, timeouts, etc. all land here.
     safeCloseWebSocket(webSocketServer);
     closeRemote(remoteSocket);
   } finally {
@@ -238,10 +219,6 @@ async function handleVlessSession(webSocketServer, uuidStr, earlyDataHeader) {
   }
 }
 
-/**
- * Reads from the remote TCP socket and forwards data to the client
- * WebSocket, prefixing the very first chunk with the VLESS response header.
- */
 async function pipeRemoteToWebSocket(tcpSocket, webSocketServer, vlessResponseHeader) {
   let headerSent = false;
   const reader = tcpSocket.readable.getReader();
@@ -268,7 +245,6 @@ async function pipeRemoteToWebSocket(tcpSocket, webSocketServer, vlessResponseHe
       }
     }
   } catch (err) {
-    // Remote/socket error - fall through to cleanup.
   } finally {
     try {
       reader.releaseLock();
@@ -281,24 +257,9 @@ function closeRemote(tcpSocket) {
   if (!tcpSocket) return;
   try {
     tcpSocket.close();
-  } catch (e) {
-    // already closed
-  }
+  } catch (e) {}
 }
 
-/**
- * Parses a VLESS protocol header.
- * Layout:
- *   1 byte    version
- *   16 bytes  UUID
- *   1 byte    addons length (N)
- *   N bytes   addons (ignored)
- *   1 byte    command (1 = TCP, 2 = UDP, 3 = MUX)
- *   2 bytes   port (big endian)
- *   1 byte    address type (1 = IPv4, 2 = domain, 3 = IPv6)
- *   variable  address
- *   ...       payload
- */
 function parseVlessHeader(buffer, expectedUuid) {
   if (!buffer || buffer.byteLength < 24) {
     return { hasError: true, message: 'Malformed VLESS header: too short' };
@@ -328,7 +289,6 @@ function parseVlessHeader(buffer, expectedUuid) {
   const command = view.getUint8(offset);
   offset += 1;
 
-  // 1 = TCP. UDP (2) and MUX (3) are not implemented and are rejected safely.
   if (command !== 1) {
     return {
       hasError: true,
@@ -352,7 +312,6 @@ function parseVlessHeader(buffer, expectedUuid) {
   let addressLength = 0;
 
   if (addressType === 1) {
-    // IPv4
     addressLength = 4;
     if (offset + addressLength > buffer.byteLength) {
       return { hasError: true, message: 'Malformed VLESS header: truncated IPv4' };
@@ -360,7 +319,6 @@ function parseVlessHeader(buffer, expectedUuid) {
     const ipBytes = new Uint8Array(buffer.slice(offset, offset + addressLength));
     addressValue = ipBytes.join('.');
   } else if (addressType === 2) {
-    // Domain name
     if (offset + 1 > buffer.byteLength) {
       return { hasError: true, message: 'Malformed VLESS header: truncated domain length' };
     }
@@ -373,7 +331,6 @@ function parseVlessHeader(buffer, expectedUuid) {
       buffer.slice(offset, offset + addressLength)
     );
   } else if (addressType === 3) {
-    // IPv6
     addressLength = 16;
     if (offset + addressLength > buffer.byteLength) {
       return { hasError: true, message: 'Malformed VLESS header: truncated IPv6' };
@@ -402,8 +359,6 @@ function parseVlessHeader(buffer, expectedUuid) {
     rawDataIndex: offset,
   };
 }
-
-// ---------- small utilities ----------
 
 function isValidUUID(uuid) {
   const regex =
@@ -434,7 +389,6 @@ function toArrayBuffer(chunk) {
       chunk.byteOffset + chunk.byteLength
     );
   }
-  // Text frame - VLESS is binary-only, treat as empty/invalid.
   return new ArrayBuffer(0);
 }
 
@@ -457,7 +411,6 @@ function base64ToArrayBuffer(base64Str) {
     }
     return { earlyData: bytes.buffer, error: null };
   } catch (error) {
-    // Not valid base64 early-data - not fatal, just ignore it.
     return { earlyData: null, error: null };
   }
 }
@@ -470,7 +423,5 @@ function safeCloseWebSocket(ws) {
     ) {
       ws.close();
     }
-  } catch (e) {
-    // ignore
-  }
+  } catch (e) {}
 }
