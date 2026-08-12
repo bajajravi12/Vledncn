@@ -2,55 +2,65 @@ import { connect } from 'cloudflare:sockets';
 
 export default {
   async fetch(request, env, ctx) {
-    const upgradeHeader = request.headers.get('Upgrade');
-
-    // 1. WebSocket Connection
-    if (upgradeHeader === 'websocket') {
+    if (request.headers.get('Upgrade') === 'websocket') {
       return await handleVlessWebSocket(request);
     }
-
-    // 2. Browser Request Response
-    return new Response('VLESS Worker is Running Successfully!', {
-      status: 200,
-      headers: { 'Content-Type': 'text/html; charset=utf-8' },
-    });
+    return new Response('VLESS Worker Active!', { status: 200 });
   }
 };
 
 async function handleVlessWebSocket(request) {
   const webSocketPair = new WebSocketPair();
   const [client, server] = Object.values(webSocketPair);
-
   server.accept();
 
-  // Path se target IP/Port read karna (e.g. /vless/98.70.26.236-443)
   const url = new URL(request.url);
   const pathParts = url.pathname.split('/').filter(Boolean);
-  
+
   let targetAddress = '1.1.1.1';
   let targetPort = 443;
 
-  if (pathParts.length >= 2) {
-    const rawTarget = pathParts[1];
-    if (rawTarget.includes('-')) {
-      const [ip, port] = rawTarget.split('-');
-      targetAddress = ip;
-      targetPort = parseInt(port) || 443;
-    }
+  if (pathParts.length >= 2 && pathParts[1].includes('-')) {
+    const [ip, port] = pathParts[1].split('-');
+    targetAddress = ip;
+    targetPort = parseInt(port) || 443;
   }
 
-  // Cloudflare TCP Socket Connection
   try {
-    const tcpSocket = connect({
-      hostname: targetAddress,
-      port: targetPort,
-    });
-
+    const tcpSocket = connect({ hostname: targetAddress, port: targetPort });
     const writer = tcpSocket.writable.getWriter();
     const reader = tcpSocket.readable.getReader();
 
+    let isFirstChunk = true;
+
     server.addEventListener('message', async (event) => {
-      await writer.write(event.data);
+      try {
+        let data = new Uint8Array(event.data);
+
+        if (isFirstChunk) {
+          isFirstChunk = false;
+          // Client ko VLESS handshake response ([0, 0]) bhejo
+          server.send(new Uint8Array([0, 0]));
+
+          // First frame me se VLESS header strip karke baki data proxy karo
+          if (data.length > 24) {
+            const optLen = data[17];
+            let headerLen = 19 + optLen;
+            const addrType = data[headerLen];
+
+            if (addrType === 1) headerLen += 7;      // IPv4
+            else if (addrType === 2) headerLen += 2 + data[headerLen + 1]; // Domain
+            else if (addrType === 3) headerLen += 19; // IPv6
+
+            if (data.length > headerLen) {
+              data = data.slice(headerLen);
+              await writer.write(data);
+            }
+          }
+        } else {
+          await writer.write(data);
+        }
+      } catch (e) {}
     });
 
     (async () => {
@@ -65,8 +75,5 @@ async function handleVlessWebSocket(request) {
     server.close();
   }
 
-  return new Response(null, {
-    status: 101,
-    webSocket: client,
-  });
+  return new Response(null, { status: 101, webSocket: client });
 }
