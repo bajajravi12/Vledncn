@@ -1,0 +1,9 @@
+name = "vless-worker"
+main = "src/index.js"
+compatibility_date = "2026-08-11"
+
+[vars]
+WS_PATH = "/vless"
+
+# UUID must NOT be set here. Configure it as a secret instead:
+#   npx wrangler secret put UUID
