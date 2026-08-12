@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "private": true,
   "description": "VLESS over WebSocket (WSS) proxy running on Cloudflare Workers.",
-  "main": "src/index.js",
+  "main": "index.js",
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
