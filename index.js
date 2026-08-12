@@ -1,79 +1,90 @@
 import { connect } from 'cloudflare:sockets';
 
+const defaultUUID = 'a40a972f-b220-4d65-9983-a563f44f9c25';
+
 export default {
   async fetch(request, env, ctx) {
-    if (request.headers.get('Upgrade') === 'websocket') {
-      return await handleVlessWebSocket(request);
+    try {
+      const uuid = env.UUID || defaultUUID;
+      if (request.headers.get('Upgrade') === 'websocket') {
+        return await handleVlessWS(request, uuid);
+      }
+      return new Response('VLESS Worker Active!', { status: 200 });
+    } catch (err) {
+      return new Response(err.toString(), { status: 500 });
     }
-    return new Response('VLESS Worker Active!', { status: 200 });
   }
 };
 
-async function handleVlessWebSocket(request) {
+async function handleVlessWS(request, uuid) {
   const webSocketPair = new WebSocketPair();
   const [client, server] = Object.values(webSocketPair);
   server.accept();
 
-  const url = new URL(request.url);
-  const pathParts = url.pathname.split('/').filter(Boolean);
+  let writer = null;
+  let isParsed = false;
 
-  let targetAddress = '1.1.1.1';
-  let targetPort = 443;
+  server.addEventListener('message', async (event) => {
+    try {
+      const chunk = new Uint8Array(event.data);
 
-  if (pathParts.length >= 2 && pathParts[1].includes('-')) {
-    const [ip, port] = pathParts[1].split('-');
-    targetAddress = ip;
-    targetPort = parseInt(port) || 443;
-  }
+      if (!isParsed) {
+        if (chunk.length < 24) return;
 
-  try {
-    const tcpSocket = connect({ hostname: targetAddress, port: targetPort });
-    const writer = tcpSocket.writable.getWriter();
-    const reader = tcpSocket.readable.getReader();
+        const version = chunk[0];
+        server.send(new Uint8Array([version, 0]));
 
-    let isFirstChunk = true;
+        const optLength = chunk[17];
+        let cursor = 18 + optLength;
+        const command = chunk[cursor++];
 
-    server.addEventListener('message', async (event) => {
-      try {
-        let data = new Uint8Array(event.data);
+        const port = (chunk[cursor] << 8) | chunk[cursor + 1];
+        cursor += 2;
 
-        if (isFirstChunk) {
-          isFirstChunk = false;
-          // Client ko VLESS handshake response ([0, 0]) bhejo
-          server.send(new Uint8Array([0, 0]));
+        const addressType = chunk[cursor++];
+        let address = '';
 
-          // First frame me se VLESS header strip karke baki data proxy karo
-          if (data.length > 24) {
-            const optLen = data[17];
-            let headerLen = 19 + optLen;
-            const addrType = data[headerLen];
-
-            if (addrType === 1) headerLen += 7;      // IPv4
-            else if (addrType === 2) headerLen += 2 + data[headerLen + 1]; // Domain
-            else if (addrType === 3) headerLen += 19; // IPv6
-
-            if (data.length > headerLen) {
-              data = data.slice(headerLen);
-              await writer.write(data);
-            }
-          }
-        } else {
-          await writer.write(data);
+        if (addressType === 1) {
+          address = chunk.slice(cursor, cursor + 4).join('.');
+          cursor += 4;
+        } else if (addressType === 2) {
+          const domainLen = chunk[cursor++];
+          address = new TextDecoder().decode(chunk.slice(cursor, cursor + domainLen));
+          cursor += domainLen;
+        } else if (addressType === 3) {
+          address = Array.from(chunk.slice(cursor, cursor + 16))
+            .reduce((s, b, i) => s + (i % 2 === 0 && i > 0 ? ':' : '') + b.toString(16).padStart(2, '0'), '');
+          cursor += 16;
         }
-      } catch (e) {}
-    });
 
-    (async () => {
-      while (true) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        server.send(value);
+        const tcpSocket = connect({ hostname: address || '1.1.1.1', port: port || 443 });
+        writer = tcpSocket.writable.getWriter();
+        const reader = tcpSocket.readable.getReader();
+
+        isParsed = true;
+
+        const payload = chunk.slice(cursor);
+        if (payload.length > 0) {
+          await writer.write(payload);
+        }
+
+        (async () => {
+          try {
+            while (true) {
+              const { value, done } = await reader.read();
+              if (done) break;
+              server.send(value);
+            }
+          } catch (e) {}
+        })();
+
+      } else if (writer) {
+        await writer.write(chunk);
       }
-    })();
-
-  } catch (err) {
-    server.close();
-  }
+    } catch (err) {
+      server.close();
+    }
+  });
 
   return new Response(null, { status: 101, webSocket: client });
 }
